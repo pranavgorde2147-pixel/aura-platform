@@ -1,0 +1,60 @@
+services:
+  # ============ Server 1 - AURA Backend (FastAPI) ============
+  - type: web
+    name: aura-server1
+    runtime: docker
+    repo: https://github.com/pranavgorde2147-pixel/aura-platform
+    dockerContext: ./aura-platform/backend
+    dockerfilePath: ./aura-platform/backend/Dockerfile
+    healthCheckPath: /api/v1/health
+    startCommand: "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: AI_SERVER_MODEL
+        value: qwen/qwen3.8-27b
+      # Set values in the Render dashboard (secrets never committed):
+      - key: POSTGRES_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: INTERNAL_API_TOKEN
+        sync: false
+      - key: AI_SERVER_URL
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+  # ============ Server 2 - Inference (Groq external provider) ============
+  - type: web
+    name: aura-server2
+    runtime: docker
+    repo: https://github.com/pranavgorde2147-pixel/aura-platform
+    dockerContext: ./server2
+    dockerfilePath: ./server2/Dockerfile
+    healthCheckPath: /health
+    startCommand: "python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: MODEL_NAME
+        value: qwen/qwen3.8-27b
+      - key: AURA_SKIP_MODEL_LOAD
+        value: "1"
+      - key: EXTERNAL_AI_URL
+        value: https://api.groq.com/openai/v1
+      - key: EXTERNAL_MODEL
+        value: qwen/qwen3.8-27b
+      - key: MAX_NEW_TOKENS
+        value: "2048"
+      - key: TEMPERATURE
+        value: "0.6"
+      - key: TOP_P
+        value: "0.95"
+      # Set values in the Render dashboard (secrets never committed):
+      - key: INTERNAL_API_TOKEN
+        sync: false
+      - key: EXTERNAL_AI_KEY
+        sync: false
