@@ -25,4 +25,4 @@ RUN mkdir -p /models && chown -R app:app /srv/server2 /models
 USER app
 EXPOSE 8001
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["sh", "-c", "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8001}"]
