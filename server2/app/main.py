@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import urllib.request
+import urllib.error
+
+import torch
+from fastapi import FastAPI, Header, HTTPException, Request
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from app.external_proxy import call_external_model
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+try:
+    torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
+
+
+def _model_name() -> str:
+    return os.getenv("MODEL_NAME", "Qwen3.5-4B")
+
+
+def _model_path() -> Path:
+    configured = os.getenv("MODEL_PATH")
+    candidates = [
+        Path(configured) if configured else None,
+        Path("/models/Qwen3.5-4B"),
+        Path("/home/pranav_gorde/aura/server2/models/Qwen3.5-4B"),
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate
+    if configured:
+        return Path(configured)
+    return Path("/models/Qwen3.5-4B")
+
+
+def _internal_api_token() -> str:
+    return os.getenv("INTERNAL_API_TOKEN", "")
+
+
+def _skip_model_load() -> bool:
+    return os.getenv("AURA_SKIP_MODEL_LOAD", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _external_api_key() -> str:
+    return os.getenv("EXTERNAL_AI_KEY", "")
+
+
+def _external_api_url() -> str:
+    return os.getenv("EXTERNAL_AI_URL", "")
+
+
+def _external_model_name() -> str:
+    return os.getenv("EXTERNAL_MODEL", "gpt-5-mini")
+
+
+app = FastAPI(title="AURA Server 2", version="0.1.0")
+
+
+class ModelRuntime:
+    def __init__(self, model_path: Path) -> None:
+        self.model_path = model_path
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = None
+        self.tokenizer = None
+        self.ready = False
+        self.load_error: Exception | None = None
+
+    def load(self) -> None:
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model mount missing: {self.model_path}")
+        if not (self.model_path / "config.json").exists():
+            raise FileNotFoundError(f"Model config missing from mounted path: {self.model_path / 'config.json'}")
+
+        dtype = torch.bfloat16 if (self.device == "cpu" or self.device == "cuda") and hasattr(torch, "bfloat16") else torch.float32
+        self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path), local_files_only=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            str(self.model_path),
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            torch_dtype=dtype,
+            use_safetensors=True,
+        )
+        self.model.to(self.device)
+        self.model.eval()
+        self.model.config.use_cache = True
+        self.ready = True
+
+
+MODEL_RUNTIME = ModelRuntime(_model_path())
+
+
+def _is_valid_uuid(value: str | None) -> bool:
+    if value is None:
+        return False
+    try:
+        uuid.UUID(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def _get_runtime() -> ModelRuntime:
+    path = _model_path()
+    global MODEL_RUNTIME
+    if MODEL_RUNTIME.model_path != path:
+        MODEL_RUNTIME = ModelRuntime(path)
+    if _skip_model_load():
+        return MODEL_RUNTIME
+    if not MODEL_RUNTIME.ready and MODEL_RUNTIME.load_error is None:
+        try:
+            MODEL_RUNTIME.load()
+        except Exception as exc:  # pragma: no cover - exercised in runtime logs
+            MODEL_RUNTIME.load_error = exc
+            raise
+    return MODEL_RUNTIME
+
+
+@app.on_event("startup")
+def startup_runtime() -> None:
+    if _skip_model_load():
+        return
+    try:
+        _get_runtime()
+    except Exception as exc:  # pragma: no cover - startup failure is logged and health reports it
+        MODEL_RUNTIME.load_error = exc
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    if _skip_model_load():
+        if _external_api_key() and _external_api_url():
+            provider_model = _external_model_name()
+            return {"status": "ok", "provider": "external", "model": provider_model, "provider_url": _external_api_url()}
+        return {"status": "ok", "provider": "local", "model": _model_name()}
+    model_name = _model_name()
+    try:
+        runtime = _get_runtime()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Qwen3.5-4B model failed to load: {exc}") from exc
+    if runtime.ready:
+        return {"status": "ok", "provider": "local", "model": model_name}
+    raise HTTPException(status_code=503, detail="Qwen3.5-4B model is unavailable")
+
+
+@app.get("/ready")
+def ready() -> dict[str, bool | str]:
+    if _skip_model_load():
+        if _external_api_key() and _external_api_url():
+            provider_model = _external_model_name()
+            return {"status": "ready", "model": provider_model, "provider": "external", "model_loaded": True}
+        return {"status": "ready", "model": _model_name(), "provider": "local", "model_loaded": True}
+    model_name = _model_name()
+    model_ready = False
+    try:
+        model_ready = _get_runtime().ready
+    except Exception:
+        model_ready = False
+    return {"status": "ready" if model_ready else "not_ready", "model": model_name, "provider": "local", "model_loaded": model_ready}
+
+
+def _build_prompt(query: str, context: dict[str, Any]) -> str:
+    safe_context = {k: v for k, v in (context or {}).items() if k not in {"vault", "password", "secret", "token", "jwt"}}
+    user_level = safe_context.get("user_level")
+    relevant_context = safe_context.get("relevant_context", {})
+    safety_constraints = safe_context.get("safety_constraints", [])
+
+    if _skip_model_load() and _external_api_key() and _external_api_url():
+        model_display = _external_model_name()
+    else:
+        model_display = _model_name()
+
+    context_lines = [
+        f"You are AURA Server 2 running the {model_display} Personal Brain.",
+        "Use only the approved context provided by Server 1.",
+        "Do not invent facts, fabricate memories, or access hidden systems.",
+        "Answer directly, concisely, and safely.",
+        "Do NOT include reasoning steps or thinking tags in your output. Give only the final answer.",
+    ]
+    if user_level:
+        context_lines.append(f"User level: {user_level}")
+    if relevant_context:
+        context_lines.append(f"Relevant context: {json.dumps(relevant_context, ensure_ascii=False, sort_keys=True)}")
+    if safety_constraints:
+        context_lines.append(f"Safety constraints: {json.dumps(safety_constraints, ensure_ascii=False, sort_keys=True)}")
+    context_lines.append(f"User query: {query}")
+    return "\n".join(context_lines)
+
+
+def _generate_test_response() -> str:
+    return "This is a test-mode response generated without loading the 8.8 GiB Qwen3.5-4B checkpoint."
+
+
+# External-hosted LLM proxy helper
+def _call_external_model(prompt: str) -> str:
+    url = _external_api_url()
+    key = _external_api_key()
+    model_name = _external_model_name()
+    if not url or not key:
+        raise RuntimeError("External AI provider not configured (EXTERNAL_AI_URL/EXTERNAL_AI_KEY)")
+
+    payload = {"model": model_name, "input": prompt}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"external provider HTTP error: {exc.code} {exc.reason}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"external provider request failed: {exc}") from exc
+
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        # Not JSON — return raw body
+        return body.strip()
+
+    # Try common response shapes
+    if isinstance(parsed, dict):
+        for k in ("response", "output", "text", "result"):
+            if k in parsed and isinstance(parsed[k], str):
+                return parsed[k].strip()
+        if "choices" in parsed and parsed["choices"]:
+            ch = parsed["choices"][0]
+            if isinstance(ch, dict):
+                if "message" in ch and isinstance(ch["message"], dict) and "content" in ch["message"]:
+                    return ch["message"]["content"].strip()
+                if "text" in ch and isinstance(ch["text"], str):
+                    return ch["text"].strip()
+    # Fallback to serialized JSON
+    return json.dumps(parsed)[:10000]
+
+
+@app.post("/v1/brain/infer")
+async def brain_infer(request: Request, authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization.split(" ", 1)[1].strip()
+    expected_token = _internal_api_token()
+    if not expected_token or token != expected_token:
+        raise HTTPException(status_code=401, detail="Invalid internal API token")
+
+    payload = await request.json()
+    user_id = payload.get("user_id")
+    query = payload.get("query")
+    model_name = payload.get("model")
+    request_id = payload.get("request_id")
+    context = payload.get("context") or {}
+
+    if not _is_valid_uuid(user_id):
+        raise HTTPException(status_code=400, detail="user_id must be a valid UUID")
+    if not isinstance(query, str) or not query.strip():
+        raise HTTPException(status_code=400, detail="query must be a non-empty string")
+    if _skip_model_load():
+        if _external_api_key() and _external_api_url():
+            expected_model = _external_model_name()
+            valid_models = {_model_name(), expected_model}
+            if model_name not in valid_models:
+                raise HTTPException(status_code=400, detail=f"model must be one of {valid_models}")
+        else:
+            expected_model = _model_name()
+            if model_name != expected_model:
+                raise HTTPException(status_code=400, detail=f"model must be exactly {expected_model}")
+    else:
+        expected_model = _model_name()
+        if model_name != expected_model:
+            raise HTTPException(status_code=400, detail=f"model must be exactly {expected_model}")
+    if request_id is not None and not _is_valid_uuid(request_id):
+        raise HTTPException(status_code=400, detail="request_id must be a valid UUID when supplied")
+    if not isinstance(context, dict):
+        raise HTTPException(status_code=400, detail="context must be an object")
+
+    # If we're running in skip mode and an external hosted LLM is configured,
+    # route the request to the external OpenAI-compatible provider (Groq) instead
+    if _skip_model_load():
+        if _external_api_key() and _external_api_url():
+            prompt = _build_prompt(query.strip(), context)
+            start = time.perf_counter()
+            try:
+                response_text = call_external_model(prompt)
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail=f"External AI provider error: {exc}") from exc
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            return {
+                "model": _external_model_name(),
+                "response": response_text,
+                "user_id": str(user_id),
+                "request_id": str(request_id) if request_id is not None else str(uuid.uuid4()),
+                "status": "ok",
+                "tokens_used": len(response_text.split()),
+                "latency_ms": latency_ms,
+            }
+
+        # fallback test response when skip mode is enabled but no external provider is configured
+        latency_ms = 0
+        start = time.perf_counter()
+        response_text = _generate_test_response()
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return {
+            "model": _model_name(),
+            "response": response_text,
+            "user_id": str(user_id),
+            "request_id": str(request_id) if request_id is not None else str(uuid.uuid4()),
+            "status": "ok",
+            "tokens_used": len(response_text.split()),
+            "latency_ms": latency_ms,
+        }
+
+    try:
+        runtime = _get_runtime()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Qwen3.5-4B model is unavailable: {exc}") from exc
+
+    if not runtime.ready or runtime.model is None or runtime.tokenizer is None:
+        raise HTTPException(status_code=503, detail="Qwen3.5-4B model is unavailable")
+
+    prompt = _build_prompt(query.strip(), context)
+    start = time.perf_counter()
+    inputs = runtime.tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to(runtime.device) for k, v in inputs.items()}
+
+    # end of local-model flow continues below
+
+    with torch.inference_mode():
+        generated = runtime.model.generate(
+            **inputs,
+            max_new_tokens=int(os.getenv("MAX_NEW_TOKENS", "96")),
+            do_sample=False,
+            temperature=float(os.getenv("TEMPERATURE", "0.2")),
+            top_p=float(os.getenv("TOP_P", "0.8")),
+            pad_token_id=runtime.tokenizer.eos_token_id,
+            eos_token_id=runtime.tokenizer.eos_token_id,
+        )
+
+    input_tokens = inputs["input_ids"].shape[1]
+    generated_tokens = generated.shape[1] - input_tokens
+    response_text = runtime.tokenizer.decode(
+        generated[0][input_tokens:],
+        skip_special_tokens=True,
+    ).strip()
+
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    if not response_text:
+        response_text = "I could not produce a response with the approved context provided."
+
+    return {
+        "model": _model_name(),
+        "response": response_text,
+        "user_id": str(user_id),
+        "request_id": str(request_id) if request_id is not None else str(uuid.uuid4()),
+        "status": "ok",
+        "tokens_used": int(generated_tokens),
+        "latency_ms": latency_ms,
+    }

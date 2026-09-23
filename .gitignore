@@ -1,0 +1,36 @@
+# Secrets - never commit these (keep .env.example templates)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Testing and tooling
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Local infrastructure artifacts (Qdrant data, markers)
+storage/
+snapshots/
+.qdrant-initialized
+
+# Server 2 model mount (read-only host directory, never bundled)
+server2/models/
+
+# Stale git worktree copies
+**/backend.worktrees/

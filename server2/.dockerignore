@@ -1,0 +1,11 @@
+# Ignore the local large model directory so it is never copied into the image build context.
+models/
+**/__pycache__/
+**/*.pyc
+.venv/
+.git/
+.gitignore
+.pytest_cache/
+.DS_Store
+*.log
+.env

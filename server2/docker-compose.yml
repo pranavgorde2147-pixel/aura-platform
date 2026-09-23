@@ -1,0 +1,26 @@
+services:
+  aura-server2:
+    build:
+      context: .
+    container_name: aura-server2
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8001
+      MODEL_NAME: qwen/qwen3.8-27b
+      MODEL_PATH: /models/Qwen3.5-4B
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      AURA_SKIP_MODEL_LOAD: ${AURA_SKIP_MODEL_LOAD:-"1"}
+      EXTERNAL_AI_URL: ${EXTERNAL_AI_URL:-}
+      EXTERNAL_AI_KEY: ${EXTERNAL_AI_KEY:-}
+      EXTERNAL_MODEL: ${EXTERNAL_MODEL:-qwen/qwen3.8-27b}
+    volumes:
+      - /home/pranav_gorde/aura/server2/models/Qwen3.5-4B:/models/Qwen3.5-4B:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; r = urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5); sys.exit(0 if r.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
